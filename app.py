@@ -14,22 +14,26 @@ password = os.getenv("PASSWORD")
 driver = GraphDatabase.driver(uri, auth=(user, password), database="neo4j")
 
 
-def get_employees(tx, filterField, filterValue, sort):
+def get_employees(tx, filters, sort):
     query = "MATCH (e:Employee)-[r]->(d:Department)"
 
-    if filterField and not filterValue:
-        return None
-
-    if filterField and filterValue and not filterField == "position":
-        query += f" WHERE e.{filterField}='{filterValue}'"
-    if filterField and filterValue and filterField == "position":
-        type = "MANAGES" if filterValue == "manager" else "WORKS_IN"
-        query += f" WHERE TYPE(r)='{type}'"
+    if filters:
+        query += " WHERE"
+        for i, (filterField, filterValue) in enumerate(filters.items()):
+            if i > 0:
+                query += " AND"
+            if filterField == "position":
+                type = "MANAGES" if filterValue == "manager" else "WORKS_IN"
+                query += f" TYPE(r)='{type}'"
+            elif filterField == "age":
+                query += f" e.{filterField}={filterValue}"
+            else:
+                query += f" e.{filterField}='{filterValue}'"
 
     query += " RETURN e.firstName as firstName, e.lastName as lastName, e.age as age"
 
     if sort:
-        query += f" ORDER BY {sort}"
+        query += f" ORDER BY {sort} DESC"
 
     results = tx.run(query).data()
     employees = [
@@ -45,20 +49,21 @@ def get_employees(tx, filterField, filterValue, sort):
 
 @app.route("/employees", methods=["GET"])
 def get_employees_route():
-    filterField = request.args.get("filter", None)
-    filterValue = request.args.get("value", None)
-    sort = request.args.get("sort", None)
+    filters = request.args.to_dict()
+    sort = filters.pop("sort", None)
 
     with driver.session() as session:
         employees = session.read_transaction(
             get_employees,
-            filterField=filterField,
-            filterValue=filterValue,
-            sort=sort,
+            filters,
+            sort,
         )
 
     if not employees:
-        return jsonify({"message": "No employees were found or invalid parameters"})
+        return (
+            jsonify({"message": "No employees were found or invalid parameters"}),
+            404,
+        )
 
     response = {"employees": employees}
     return jsonify(response)
@@ -91,7 +96,10 @@ def add_employee_route():
         employee = session.write_transaction(add_employee, firstName, lastName, age)
 
     if employee is None:
-        return jsonify({"message": "Employee already exists or fields are missing"})
+        return (
+            jsonify({"message": "Employee already exists or fields are missing"}),
+            500,
+        )
 
     response = {"status": "success"}
     return jsonify(response)
@@ -197,58 +205,81 @@ def get_subordinates_route(id):
         employees = session.read_transaction(get_subordinates, id)
 
     if not employees:
-        return jsonify({"message": "No subordinates were found"})
+        return jsonify({"message": "No subordinates were found"}), 404
 
     response = {"employees": employees}
     return jsonify(response)
 
 
-# TODO:
-def get_departments(tx, filterField, filterValue, sort):
-    query = "MATCH (d:Department)"
+def get_employee_department(tx, id):
+    query = "MATCH (e:Employee)-[:WORKS_IN]->(d:Department)<-[:MANAGES]-(m:Employee) WHERE id(e)=$id WITH d, m MATCH (all:Employee)-[:WORKS_IN]->(d) RETURN d.name as department, count(all) as numberOfEmployees, m.firstName + ' ' + m.lastName as manager"
 
-    possibleFields = tx.run(
-        "MATCH (n:Department) UNWIND keys(n) AS fields RETURN DISTINCT fields"
-    ).data()
+    result = tx.run(query, id=id).data()
 
-    if filterField and not filterValue:
+    if result:
+        return result[0]
+    else:
         return None
 
-    if filterField and filterValue and filterField in possibleFields:
-        query += f" WHERE d.{filterField}='{filterValue}'"
 
-    query += " RETURN d.name as name"
+@app.route("/employees/<int:id>/department", methods=["GET"])
+def get_employee_department_route(id):
+    with driver.session() as session:
+        department = session.read_transaction(get_employee_department, id)
+
+    if not department:
+        return jsonify({"message": "Employee or department not found"}), 404
+
+    response = {"department": department}
+    return jsonify(response)
+
+
+def get_departments(tx, filters, sort):
+    query = "MATCH (d:Department)<-[:WORKS_IN]-(e)"
+
+    if filters:
+        query += " WHERE"
+        for i, (filterField, filterValue) in enumerate(filters.items()):
+            if i > 0:
+                query += " AND"
+            query += f" d.{filterField}='{filterValue}'"
+
+    query += " RETURN d.name as name, count(e) as numberOfEmployees"
 
     if sort:
-        query += f" ORDER BY {sort}"
+        query += f" ORDER BY {sort} DESC"
 
     results = tx.run(query).data()
-    departments = [{"todo": result} for result in results]
+    departments = [
+        {
+            "name": result["name"],
+            "numberOfEmployees": result["numberOfEmployees"],
+        }
+        for result in results
+    ]
     return departments
 
 
 @app.route("/departments", methods=["GET"])
 def get_departments_route():
-    filterField = request.args.get("filter", None)
-    filterValue = request.args.get("value", None)
-    sort = request.args.get("sort", None)
+    filters = request.args.to_dict()
+    sort = filters.pop("sort", None)
 
     with driver.session() as session:
         departments = session.read_transaction(
             get_departments,
-            filterField=filterField,
-            filterValue=filterValue,
-            sort=sort,
+            filters,
+            sort,
         )
 
     if not departments:
-        return jsonify({"message": "No departments were found or invalid parameters"})
+        return (
+            jsonify({"message": "No departments were found or invalid parameters"}),
+            404,
+        )
 
     response = {"departments": departments}
     return jsonify(response)
-
-
-# -----
 
 
 def get_department_employees(tx, id):
@@ -272,7 +303,7 @@ def get_department_employees_route(id):
         employees = session.read_transaction(get_department_employees, id)
 
     if not employees:
-        return jsonify({"message": "No employees were found"})
+        return jsonify({"message": "No employees were found"}), 404
 
     response = {"employees": employees}
     return jsonify(response)

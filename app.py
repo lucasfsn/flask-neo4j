@@ -66,22 +66,37 @@ def get_employees_route():
         )
 
     response = {"employees": employees}
-    return jsonify(response)
+    return jsonify(response), 200
 
 
-def add_employee(tx, firstName, lastName, age):
-    if firstName is None or lastName is None or age is None:
+def add_employee(tx, firstName, lastName, age, position, department):
+    if None in [firstName, lastName, age, position, department]:
         return None
 
-    exist = "MATCH (e:Employee {firstName: $firstName, lastName: $lastName, age: $age}) RETURN e"
-    result = tx.run(exist, firstName=firstName, lastName=lastName, age=age)
+    exist_department = "MATCH (d:Department {name: $department}) RETURN d"
+    result_department = tx.run(exist_department, department=department)
 
-    if result.single() is not None:
+    if result_department.single() is None:
+        return None
+
+    exist_employee = "MATCH (e:Employee {firstName: $firstName, lastName: $lastName, age: $age}) RETURN e"
+    result_employee = tx.run(
+        exist_employee, firstName=firstName, lastName=lastName, age=age
+    )
+
+    if result_employee.single() is not None:
         return None
 
     add = "CREATE (e:Employee {firstName: $firstName, lastName: $lastName, age: $age})"
 
     tx.run(add, firstName=firstName, lastName=lastName, age=age)
+
+    work = "MATCH (e:Employee {firstName: $firstName, lastName: $lastName}), (d:Department {name: $department}) CREATE (e)-[:WORKS_IN]->(d)"
+    tx.run(work, firstName=firstName, lastName=lastName, department=department)
+
+    if position.lower() == "manager":
+        manage = "MATCH (e:Employee {firstName: $firstName, lastName: $lastName}), (d:Department {name: $department}) CREATE (e)-[:MANAGES]->(d) RETURN e"
+        tx.run(manage, firstName=firstName, lastName=lastName, department=department)
 
     return True
 
@@ -91,9 +106,13 @@ def add_employee_route():
     firstName = request.json.get("firstName", None)
     lastName = request.json.get("lastName", None)
     age = request.json.get("age", None)
+    position = request.json.get("position", None)
+    department = request.json.get("department", None)
 
     with driver.session() as session:
-        employee = session.write_transaction(add_employee, firstName, lastName, age)
+        employee = session.write_transaction(
+            add_employee, firstName, lastName, age, position, department
+        )
 
     if employee is None:
         return (
@@ -101,37 +120,71 @@ def add_employee_route():
             500,
         )
 
-    response = {"status": "success"}
-    return jsonify(response)
+    response = {"status": "Employee added successfully"}
+    return jsonify(response), 201
 
 
-def edit_employee(tx, id, firstName, lastName, age):
+def edit_employee(tx, id, firstName, lastName, age, position, department):
     params = {"id": id}
 
     result = tx.run("MATCH (e:Employee) WHERE id(e)=$id RETURN e", id=id).data()
 
     if not result:
-        return None
+        return {
+            "status": "error",
+            "message": "No employee found with the given id",
+        }
 
-    query = "MATCH (e:Employee) WHERE id(e)=$id SET"
+    if any([firstName, lastName, age]):
+        query = "MATCH (e:Employee) WHERE id(e)=$id SET"
 
-    if firstName is not None:
-        query += " e.firstName = $firstName, "
-        params["firstName"] = firstName
-    if lastName is not None:
-        query += " e.lastName = $lastName, "
-        params["lastName"] = lastName
-    if age is not None:
-        query += " e.age = $age, "
-        params["age"] = age
+        if firstName is not None:
+            query += " e.firstName = $firstName, "
+            params["firstName"] = firstName
+        if lastName is not None:
+            query += " e.lastName = $lastName, "
+            params["lastName"] = lastName
+        if age is not None:
+            query += " e.age = $age, "
+            params["age"] = age
 
-    query = query.rstrip(", ")
+        query = query.rstrip(", ")
 
-    query += " RETURN e"
+        query += " RETURN e"
 
-    tx.run(query, **params)
+        tx.run(query, **params)
 
-    return jsonify({"id": id})
+    if position is not None and department is None:
+        return {
+            "status": "error",
+            "message": "Department cannot be None when position is provided",
+        }
+
+    if department is not None:
+        exist_department = "MATCH (d:Department {name: $department}) RETURN d"
+        result_department = tx.run(exist_department, department=department)
+
+        if result_department.single() is None:
+            return None
+
+        tx.run(
+            "MATCH (e:Employee)-[r:WORKS_IN|MANAGES]->() WHERE id(e)=$id DELETE r",
+            id=id,
+        )
+        tx.run(
+            "MATCH (e:Employee), (d:Department {name: $department}) WHERE id(e)=$id CREATE (e)-[:WORKS_IN]->(d)",
+            id=id,
+            department=department,
+        )
+
+        if position is not None and position.lower() == "manager":
+            tx.run(
+                "MATCH (e:Employee), (d:Department {name: $department}) WHERE id(e)=$id CREATE (e)-[:MANAGES]->(d)",
+                id=id,
+                department=department,
+            )
+
+    return {"status": "success", "message": "Employee edited successfully."}
 
 
 @app.route("/employees/<int:id>", methods=["PUT"])
@@ -139,18 +192,22 @@ def edit_employee_route(id):
     firstName = request.json.get("firstName", None)
     lastName = request.json.get("lastName", None)
     age = request.json.get("age", None)
+    position = request.json.get("position", None)
+    department = request.json.get("department", None)
 
     with driver.session() as session:
-        employee = session.write_transaction(
-            edit_employee, id, firstName, lastName, age
+        res = session.write_transaction(
+            edit_employee, id, firstName, lastName, age, position, department
         )
 
-    if not employee:
-        response = {"message": "Employee not found"}
-        return jsonify(response)
+    if res is None:
+        return jsonify({"message": "An error occurred while editing the employee"}), 500
 
-    response = {"status": "success"}
-    return jsonify(response)
+    if res["status"] == "error":
+        return jsonify({"message": res["message"]}), 400
+
+    response = {"status": "success", "message": res["message"]}
+    return jsonify(response), 201
 
 
 def delete_employee(tx, id):
@@ -181,8 +238,8 @@ def delete_employee_route(id):
         response = {"message": "Employee not found"}
         return jsonify(response), 404
 
-    response = {"status": "success"}
-    return jsonify(response)
+    response = {"status": "Employee deleted successfully"}
+    return jsonify(response), 201
 
 
 def get_subordinates(tx, id):
@@ -208,7 +265,7 @@ def get_subordinates_route(id):
         return jsonify({"message": "No subordinates were found"}), 404
 
     response = {"employees": employees}
-    return jsonify(response)
+    return jsonify(response), 200
 
 
 def get_employee_department(tx, id):
@@ -231,7 +288,7 @@ def get_employee_department_route(id):
         return jsonify({"message": "Employee or department not found"}), 404
 
     response = {"department": department}
-    return jsonify(response)
+    return jsonify(response), 200
 
 
 def get_departments(tx, filters, sort):
@@ -279,7 +336,7 @@ def get_departments_route():
         )
 
     response = {"departments": departments}
-    return jsonify(response)
+    return jsonify(response), 200
 
 
 def get_department_employees(tx, id):
@@ -306,7 +363,7 @@ def get_department_employees_route(id):
         return jsonify({"message": "No employees were found"}), 404
 
     response = {"employees": employees}
-    return jsonify(response)
+    return jsonify(response), 200
 
 
 if __name__ == "__main__":
